@@ -1,23 +1,23 @@
-gradio
-numpy
-faster-whisper
-openai-whisper
-ffmpeg-python
+gradio==5.32.0
+numpy==2.2.6
+nltk==3.9.1
+faster-whisper==1.1.1
+openai-whisper==20240930
+ffmpeg-python==0.2.0
 auto-editor==27.1.1
 resampy==0.4.3
 librosa==0.10.0
-s3tokenizer
-spaces
+s3tokenizer==0.1.7
+spaces==0.36.0
 transformers==4.46.3
 diffusers==0.29.0
 omegaconf==2.3.0
 resemble-perth==1.0.1
 silero-vad==5.1.2
 conformer==0.3.2
+soundfile==0.13.1
 pyrnnoise==0.3.8
-soundfile
-nltk
---extra-index-url=https://download.pytorch.org/whl/cu128
-torch==2.7.0
-torchaudio==2.7.0
+    --extra-index-url=https://download.pytorch.org/whl/cu128
+    torch==2.7.0
+    torchaudio==2.7.0
 
