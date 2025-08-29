@@ -27,6 +27,7 @@ import argparse
 import soundfile as sf
 import inspect, traceback
 from chatterbox.src.chatterbox.vc import ChatterboxVC
+import tempfile
 try:
     import pyrnnoise
     _PYRNNOISE_AVAILABLE = True
@@ -143,20 +144,20 @@ def voice_conversion(input_audio_path, target_voice_audio_path, chunk_sec=60, ov
     step_samples = chunk_samples - overlap_samples
 
     out_chunks = []
-    for start in range(0, len(wav), step_samples):
-        end = min(start + chunk_samples, len(wav))
-        chunk = wav[start:end]
-        temp_chunk_path = f"temp_vc_chunk_{start}_{end}.wav"
-        sf.write(temp_chunk_path, chunk, model_sr)
-        out_chunk = vc_model.generate(
-            temp_chunk_path,
-            target_voice_path=target_voice_audio_path,
-            apply_watermark=not disable_watermark,
-            pitch_shift=pitch_shift
-        )
-        out_chunk_np = out_chunk.squeeze(0).numpy()
-        out_chunks.append(out_chunk_np)
-        os.remove(temp_chunk_path)
+    with tempfile.TemporaryDirectory(prefix="vc_chunk_") as tmpdir:
+        for start in range(0, len(wav), step_samples):
+            end = min(start + chunk_samples, len(wav))
+            chunk = wav[start:end]
+            temp_chunk_path = os.path.join(tmpdir, f"chunk_{start}_{end}.wav")
+            sf.write(temp_chunk_path, chunk, model_sr)
+            out_chunk = vc_model.generate(
+                temp_chunk_path,
+                target_voice_path=target_voice_audio_path,
+                apply_watermark=not disable_watermark,
+                pitch_shift=pitch_shift
+            )
+            out_chunk_np = out_chunk.squeeze(0).numpy()
+            out_chunks.append(out_chunk_np)
 
     # Crossfade join as before...
     result = out_chunks[0]
