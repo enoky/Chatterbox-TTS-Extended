@@ -91,7 +91,10 @@ class ChatterboxVC:
         if target_voice_path:
             self.set_target_voice(target_voice_path, pitch_shift)
         else:
-            assert self.ref_dict is not None, "Please `prepare_conditionals` first or specify `target_voice_path`"
+            if self.ref_dict is None:
+                raise RuntimeError(
+                    "Please `set_target_voice` first or specify `target_voice_path`"
+                )
 
         with torch.inference_mode():
             audio_16, _ = librosa.load(audio, sr=S3_SR)
