@@ -1,5 +1,7 @@
 # 🚀 Chatterbox-TTS-Extended — All Features & Technical Explanations
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/enoky/Chatterbox-TTS-Extended/blob/main/Chatterbox_TTS_Extended_Colab.ipynb)
+
 Chatterbox-TTS-Extended is a *power-user TTS pipeline* for advanced single and batch speech synthesis, voice conversion, and artifact-reduced audio generation. It is based on [Chatterbox-TTS](https://github.com/resemble-ai/chatterbox), but adds:
 
 - **Multi-file input & batch output**
@@ -211,6 +213,12 @@ Convert any voice to sound like another!
 ---
 
 ## 📝 Installation
+
+### Run free on Google Colab
+
+No local GPU? Click the **Open in Colab** badge at the top of this page, switch the runtime to a **T4 GPU**, and run the cells in order. The Launch cell prints a public `gradio.live` link to the full UI. Outputs can be saved to Google Drive or downloaded as a zip.
+
+### Run locally
 
 Requires **Python 3.10.x** and **[FFmpeg](https://ffmpeg.org/download.html)** (on PATH).
 
