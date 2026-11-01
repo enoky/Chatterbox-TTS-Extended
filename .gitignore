@@ -2,6 +2,11 @@
 __pycache__
 .mypy_cache/
 .venv/
+venv/
 
 # VS Code
 *.code-workspace
+
+# Output Folders
+output/
+temp/
