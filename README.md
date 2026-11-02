@@ -156,6 +156,7 @@ Chatterbox-TTS-Extended is a *power-user TTS pipeline* for advanced single and b
 - **Per-chunk validation:** Each audio chunk is transcribed and compared to its intended text.
 - **Bypass option:** Skip Whisper entirely (faster, but may allow more TTS errors).
 - **Use-longest-transcript-on-fail:** Optional fallback if no candidate passes validation.
+- **faster-whisper on GPU:** CTranslate2 needs the CUDA 12 cuBLAS runtime, installed by `nvidia-cublas-cu12` in `requirements.txt` and picked up automatically at startup. If it can't use the GPU, the app falls back to faster-whisper on CPU (int8), and if faster-whisper can't load at all, to OpenAI Whisper; the console shows a `[WARN]` with the reason.
 
 ---
 
@@ -269,6 +270,7 @@ Open an issue or pull request for suggestions, bug reports, or improvements!
 
 It seems if you use fasterwhisper for validation, sometimes it just silently crashes. Apparently this has to do with using the fasterwhisper model. It's not actually the python code. So if you are experiencing this, switch back to the original WhisperSync model. 
 UPDATE: with the latest update this bug may have been resolved.
+If faster-whisper fails with `Library cublas64_12.dll is not found` (or `libcublas.so.12`), run `pip install -r requirements.txt` again so `nvidia-cublas-cu12` is installed.
 
 ---
 

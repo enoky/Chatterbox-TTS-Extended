@@ -20,7 +20,43 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import whisper
 import nltk
 from nltk.tokenize import sent_tokenize
-from faster_whisper import WhisperModel as FasterWhisperModel
+
+
+def _add_cuda12_runtime_paths():
+    """Make pip-installed CUDA 12 libs (nvidia-cublas-cu12) visible to CTranslate2.
+
+    faster-whisper's CTranslate2 needs cuBLAS 12, while torch may ship a different
+    CUDA major (e.g. cu132 wheels bundle cublas64_13 only).
+    """
+    import glob, site, sys
+    roots = [os.path.join(sp, "nvidia") for sp in site.getsitepackages() + [site.getusersitepackages()]]
+    if sys.platform == "win32":
+        for root in roots:
+            for d in glob.glob(os.path.join(root, "*", "bin")):
+                try:
+                    os.add_dll_directory(d)
+                except OSError:
+                    continue
+                os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+    elif sys.platform.startswith("linux"):
+        import ctypes
+        for root in roots:
+            for lib in ("libcublasLt.so.12", "libcublas.so.12"):
+                for f in glob.glob(os.path.join(root, "cublas", "lib", lib)):
+                    try:
+                        ctypes.CDLL(f, mode=ctypes.RTLD_GLOBAL)
+                    except OSError:
+                        pass
+
+
+_add_cuda12_runtime_paths()
+try:
+    from faster_whisper import WhisperModel as FasterWhisperModel
+    _FASTER_WHISPER_AVAILABLE = True
+except Exception as _fw_err:
+    print(f"[WARN] faster-whisper unavailable ({_fw_err}); OpenAI Whisper will be used instead.")
+    FasterWhisperModel = None
+    _FASTER_WHISPER_AVAILABLE = False
 import json
 import csv
 import argparse
@@ -281,30 +317,40 @@ def _free_vram():
 def load_whisper_backend(model_name, use_faster_whisper, device):
     """
     Load Whisper with VRAM-friendly fallbacks:
-      CUDA: try float16 -> int8_float16 -> int8
+      CUDA: try float16 -> int8_float16 -> int8 -> CPU int8
       non-CUDA: try int8 -> float32
+    Falls back to OpenAI Whisper if faster-whisper can't be imported or loaded.
     """
+    if use_faster_whisper and not _FASTER_WHISPER_AVAILABLE:
+        print("[WARN] faster-whisper is not installed or failed to import; using OpenAI Whisper instead.")
+        use_faster_whisper = False
     if use_faster_whisper:
         _free_vram()  # free memory before constructing Faster-Whisper
         if device == "cuda":
-            candidates = ["float16", "int8_float16", "int8"]
+            candidates = [("cuda", "float16"), ("cuda", "int8_float16"), ("cuda", "int8")]
         else:
-            candidates = ["int8", "float32"]
+            candidates = [(device, "int8"), (device, "float32")]
+        if device != "cpu":
+            # Last resort when CTranslate2 can't use the GPU (e.g. cuBLAS 12 missing)
+            candidates.append(("cpu", "int8"))
 
         last_err = None
-        for ct in candidates:
+        for dev, ct in candidates:
             try:
-                print(f"[DEBUG] Loading faster-whisper model: {model_name} (device={device}, compute_type={ct})")
-                return FasterWhisperModel(model_name, device=device, compute_type=ct)
+                if dev != device:
+                    print(f"[WARN] faster-whisper can't run on {device} ({last_err}); falling back to CPU int8 (slower).")
+                print(f"[DEBUG] Loading faster-whisper model: {model_name} (device={dev}, compute_type={ct})")
+                model = FasterWhisperModel(model_name, device=dev, compute_type=ct)
+                # CUDA libs (cuBLAS/cuDNN) load lazily, so run a tiny transcription to surface errors now
+                list(model.transcribe(np.zeros(16000, dtype=np.float32))[0])
+                return model
             except Exception as e:
                 last_err = e
-                print(f"[WARN] Failed loading faster-whisper ({ct}): {e}")
+                print(f"[WARN] Failed loading faster-whisper ({dev}, {ct}): {e}")
 
-        raise RuntimeError(
-            f"Failed to load Faster-Whisper '{model_name}' on device={device}. "
-            f"Tried compute_types={candidates}. Last error: {last_err}"
-        )
-    else:
+        print(f"[WARN] Failed to load faster-whisper '{model_name}' (last error: {last_err}); using OpenAI Whisper instead.")
+        use_faster_whisper = False
+    if not use_faster_whisper:
         print(f"[DEBUG] Loading openai-whisper model: {model_name}")
         _free_vram()  # also free before OpenAI-whisper to reduce fragmentation
         return whisper.load_model(model_name, device=device)
@@ -699,8 +745,12 @@ def whisper_check_mp(candidate_path, target_text, whisper_model, use_faster_whis
 
     try:
         print(f"\033[32m[DEBUG] Whisper checking: {candidate_path}\033[0m")
+        # load_whisper_backend may have fallen back to OpenAI Whisper
+        use_faster_whisper = _FASTER_WHISPER_AVAILABLE and isinstance(whisper_model, FasterWhisperModel)
         if use_faster_whisper:
-            segments, info = whisper_model.transcribe(candidate_path)
+            # Decode ourselves: faster-whisper's PyAV loader breaks with newer `av` releases
+            audio, _ = librosa.load(candidate_path, sr=16000, mono=True)
+            segments, info = whisper_model.transcribe(audio)
             transcribed = "".join([seg.text for seg in segments]).strip().lower()
         else:
             result = whisper_model.transcribe(candidate_path)
