@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
+import os
 
 import librosa
 import torch
@@ -19,6 +20,21 @@ from .models.s3gen import S3GEN_SR, S3Gen
 from .models.tokenizers import EnTokenizer
 from .models.voice_encoder import VoiceEncoder
 from .models.t3.modules.cond_enc import T3Cond
+
+
+def _pick_t3_dtype(device) -> torch.dtype:
+    """Precision for the T3 Llama backbone, set with CHATTERBOX_T3_DTYPE=auto|fp32|fp16|bf16.
+
+    auto (default): fp16 on CUDA GPUs, fp32 on CPU/MPS. fp16 tracks fp32 more closely
+    than bf16 here and runs on older GPUs (e.g. T4) too.
+    """
+    choice = os.environ.get("CHATTERBOX_T3_DTYPE", "auto").strip().lower()
+    named = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
+    if choice in named:
+        return named[choice]
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        return torch.float16
+    return torch.float32
 
 REPO_ID = "ResembleAI/chatterbox"
 
@@ -88,6 +104,10 @@ class ChatterboxTTS:
             t3_state = t3_state["model"][0]
         t3.load_state_dict(t3_state)
         t3.to(device).eval()
+        t3_dtype = _pick_t3_dtype(device)
+        if t3_dtype != torch.float32:
+            t3.set_inference_dtype(t3_dtype)
+        print(f"T3 backbone dtype: {t3_dtype}")
 
         s3gen = S3Gen()
         s3gen.load_state_dict(load_file(ckpt_dir / "s3gen.safetensors"), strict=False)

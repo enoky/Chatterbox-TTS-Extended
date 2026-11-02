@@ -76,8 +76,9 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
         past_key_values: Optional[torch.Tensor]=None,
         use_cache=True,
         output_attentions=False,
-        output_hidden_states=True,
+        output_hidden_states=False,
         return_dict=True,
+        cache_position=None,
     ):
         """
         This is a method used by huggingface's generate() method.
@@ -87,20 +88,24 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
         S should be 1.
         """
         is_large_input = inputs_embeds.size(1) != 1
-        has_cache = past_key_values is not None and len(past_key_values) > 0
-        assert not (is_large_input and has_cache)
+        # Only check on multi-token inputs: get_seq_length() syncs with the GPU, which
+        # isn't allowed inside a captured CUDA graph (single-token decode).
+        if is_large_input and past_key_values is not None:
+            assert past_key_values.get_seq_length() == 0, "multi-token input needs an empty cache"
         assert return_dict
-        assert output_hidden_states
 
+        # The backbone may run in fp16/bf16 (see T3.set_inference_dtype); the custom
+        # embedding and head layers stay in fp32.
         tfmr_out = self.model(
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds.to(self.model.dtype),
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=True,
+            cache_position=cache_position,
         )
-        hidden_states = tfmr_out.hidden_states[-1]  # (B, seq, dim)
+        hidden_states = tfmr_out.last_hidden_state.to(self.speech_head.weight.dtype)  # (B, seq, dim)
 
         logits = self.speech_head(hidden_states)
         # assert inputs_embeds.size(0) == 1 # (disabled for CFG)

@@ -164,6 +164,9 @@ Chatterbox-TTS-Extended is a *power-user TTS pipeline* for advanced single and b
 - **Full parallelism:** User-configurable worker count (default 4).
 - **Worker control:** Set to 1 for low-memory or debugging, higher for speed.
 - **VRAM management:** Clears Whisper model and GPU cache after validation to avoid leaks.
+- **Fast decoding on NVIDIA GPUs:** The speech-token model runs in fp16 and replays each decode step as a CUDA graph, about 2.5–3× faster than the plain loop and ~1 GB less VRAM. Speech tokens match the full-precision output.
+  - `CHATTERBOX_T3_DTYPE=fp32|fp16|bf16` overrides the precision (default `auto`: fp16 on CUDA, fp32 on CPU).
+  - `CHATTERBOX_CUDA_GRAPHS=0` turns off CUDA graphs. The app also falls back on its own if graph capture fails.
 
 ---
 

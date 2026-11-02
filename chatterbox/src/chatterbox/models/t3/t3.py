@@ -1,6 +1,8 @@
 # Copyright (c) 2025 Resemble AI
 # MIT License
 import logging
+import os
+import threading
 from typing import Optional, Tuple
 
 from tqdm import tqdm
@@ -15,6 +17,7 @@ from .modules.cond_enc import T3CondEnc, T3Cond
 from .modules.t3_config import T3Config
 from .llama_configs import LLAMA_CONFIGS
 from .inference.t3_hf_backend import T3HuggingfaceBackend
+from .inference.cuda_graph_decoder import CudaGraphDecoder
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +29,17 @@ class GenerationInterrupted(Exception):
 # Optional callable polled once per sampled token; the UI sets it so a Stop button
 # can abort a chunk mid-generation instead of waiting for it to finish.
 stop_check = None
+
+# Checking for end-of-speech forces a GPU->CPU sync, which stops the CPU from queuing
+# the next step while the GPU works. Check every N steps instead; rows that already
+# finished keep emitting stop tokens, which callers drop.
+EOS_CHECK_INTERVAL = 8
+
+# Replay the decode step as a CUDA graph (see CudaGraphDecoder). Set
+# CHATTERBOX_CUDA_GRAPHS=0 to use the plain eager loop instead.
+USE_CUDA_GRAPHS = os.environ.get("CHATTERBOX_CUDA_GRAPHS", "1").strip() != "0"
+# Static cache sizes are rounded up to this so one captured graph serves most chunks.
+GRAPH_CACHE_BUCKET = 256
 
 
 class AttrDict(dict):
@@ -70,9 +84,20 @@ class T3(nn.Module):
         self.speech_head = nn.Linear(self.cfg.hidden_size, hp.speech_tokens_dict_size, bias=False)
         self.compiled = False
 
+        # CUDA-graph decoding state, shared by all threads using this model.
+        self._graph_decoder = None
+        self._graph_lock = threading.Lock()
+        self._graphs_failed = False
+
     @property
     def device(self):
         return self.speech_head.weight.device
+
+    def set_inference_dtype(self, dtype: torch.dtype):
+        """Run the Llama backbone in `dtype` (fp16/bf16 roughly doubles decode speed on GPUs
+        with tensor cores). Embeddings, conditioning and logit heads stay in fp32."""
+        self.tfmr.to(dtype)
+        self._graph_decoder = None  # captured for the old dtype
 
     def prepare_conditioning(self, t3_cond: T3Cond):
         """
@@ -216,20 +241,72 @@ class T3(nn.Module):
         """
         Shared sampling loop, vectorized. Returns predicted cond tokens: (B, T).
         """
+        use_graphs = USE_CUDA_GRAPHS and inputs_embeds.is_cuda and not self._graphs_failed
+        if use_graphs:
+            # One captured graph per model: threads take turns (the GPU is saturated
+            # during graph decoding anyway, so running them side by side gains little).
+            with self._graph_lock:
+                try:
+                    decoder = self._get_graph_decoder(
+                        batch_size=inputs_embeds.size(0),
+                        needed_len=inputs_embeds.size(1) + max_new_tokens + 1,
+                    )
+                    return self._sample_tokens(decoder, inputs_embeds, cfg_weight, max_new_tokens, temperature,
+                                               top_p, repetition_penalty, generator, cond_batch, stop_id)
+                except GenerationInterrupted:
+                    raise
+                except Exception as e:
+                    logger.warning("CUDA graph decoding failed (%s: %s); using the eager loop from now on.",
+                                   type(e).__name__, e)
+                    self._graphs_failed = True
+                    self._graph_decoder = None
+        return self._sample_tokens(None, inputs_embeds, cfg_weight, max_new_tokens, temperature,
+                                   top_p, repetition_penalty, generator, cond_batch, stop_id)
+
+    def _get_graph_decoder(self, batch_size: int, needed_len: int) -> CudaGraphDecoder:
+        decoder = self._graph_decoder
+        if decoder is None or decoder.batch_size != batch_size or decoder.max_cache_len < needed_len:
+            self._graph_decoder = None  # release the old cache before allocating a new one
+            max_len = -(-needed_len // GRAPH_CACHE_BUCKET) * GRAPH_CACHE_BUCKET
+            decoder = CudaGraphDecoder(self.patched_model, batch_size, max_len)
+            self._graph_decoder = decoder
+        return decoder
+
+    def _sample_tokens(self, decoder, inputs_embeds, cfg_weight, max_new_tokens, temperature,
+                       top_p, repetition_penalty, generator, cond_batch, stop_id) -> Tensor:
+        """The sampling loop. Uses `decoder` (a CudaGraphDecoder) when given, else the
+        eager backend with a dynamic KV cache."""
         # Logit processors
         top_p_warper = TopPLogitsWarper(top_p=top_p)
         repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty)
 
-        # Initial forward
-        output = self.patched_model(
-            inputs_embeds=inputs_embeds,
-            past_key_values=None,
-            use_cache=True,
-            output_attentions=True,       # was False
-            output_hidden_states=True,    # was False (this was causing the assert)
-            return_dict=True,
-        )
-        past = output.past_key_values
+        # Initial forward. Attentions and per-layer hidden states are not requested:
+        # nothing reads them, and output_attentions=True forces the slow eager attention path.
+        ctx_len = inputs_embeds.size(1)
+        if decoder is not None:
+            step_logits = decoder.prefill(inputs_embeds)[:, -1, :]
+
+            def advance(embed, i):
+                return decoder.step(embed, ctx_len + i)[:, -1, :]
+        else:
+            output = self.patched_model(
+                inputs_embeds=inputs_embeds,
+                past_key_values=None,
+                use_cache=True,
+                return_dict=True,
+            )
+            past = output.past_key_values
+            step_logits = output.logits[:, -1, :]
+
+            def advance(embed, i):
+                nonlocal past
+                output = self.patched_model(
+                    inputs_embeds=embed,
+                    past_key_values=past,
+                    return_dict=True,
+                )
+                past = output.past_key_values
+                return output.logits[:, -1, :]
 
         # Track generated tokens for the COND rows only
         device = inputs_embeds.device
@@ -242,7 +319,6 @@ class T3(nn.Module):
         for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True):
             if stop_check is not None and stop_check():
                 raise GenerationInterrupted()
-            step_logits = output.logits[:, -1, :]  # (2B or B, V)
 
             if cfg_weight > 0.0:
                 # cond rows are 0,2,4,...; uncond rows are 1,3,5,...
@@ -270,7 +346,7 @@ class T3(nn.Module):
 
             # Update alive mask
             alive &= (next_token.view(-1) != stop_id)
-            if not alive.any():
+            if (i + 1) % EOS_CHECK_INTERVAL == 0 and not alive.any():
                 break
 
             # Advance the model one token (duplicate for CFG if used)
@@ -278,16 +354,16 @@ class T3(nn.Module):
             if cfg_weight > 0.0:
                 next_tok_embed = torch.repeat_interleave(next_tok_embed, repeats=2, dim=0)                 # (2B,1,D)
 
-            output = self.patched_model(
-                inputs_embeds=next_tok_embed,
-                past_key_values=past,
-                output_attentions=True,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            past = output.past_key_values
+            step_logits = advance(next_tok_embed, i)  # (2B or B, V)
 
-        return torch.cat(predicted, dim=1) if predicted else torch.zeros(cond_batch, 0, dtype=torch.long, device=device)
+        if not predicted:
+            return torch.zeros(cond_batch, 0, dtype=torch.long, device=device)
+        out = torch.cat(predicted, dim=1)
+        # Drop the extra stop tokens emitted between EOS checks: keep each row up to its
+        # first stop token, so the output matches checking every step.
+        is_stop = out == stop_id
+        ends = torch.where(is_stop.any(dim=1), is_stop.int().argmax(dim=1) + 1, out.size(1))
+        return out[:, :int(ends.max())]
 
     @torch.inference_mode()
     def inference(
