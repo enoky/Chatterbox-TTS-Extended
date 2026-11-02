@@ -718,6 +718,90 @@ def whisper_check_mp(candidate_path, target_text, whisper_model, use_faster_whis
         return (candidate_path, 0.0, f"ERROR: {e}")
         
         
+# ----- STOP & PROGRESS -----
+import threading
+from chatterbox.src.chatterbox.models.t3 import t3 as t3_module
+from chatterbox.src.chatterbox.models.t3.t3 import GenerationInterrupted
+
+_stop_event = threading.Event()
+# Let the model's sampling loop abort mid-chunk when Stop is pressed.
+t3_module.stop_check = _stop_event.is_set
+
+
+class GenerationStopped(BaseException):
+    """Raised in the main generation flow when the user presses Stop.
+
+    Derives from BaseException so the many `except Exception` blocks don't swallow it.
+    """
+
+
+def check_stop():
+    if _stop_event.is_set():
+        raise GenerationStopped()
+
+
+def request_stop():
+    _stop_event.set()
+    print("\033[33m[STOP] Stop requested; interrupting generation...\033[0m")
+    return "⏹ Stopping… interrupting the current step."
+
+
+def _fmt_secs(secs):
+    secs = int(max(0, secs))
+    m, s = divmod(secs, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h{m:02d}m{s:02d}s"
+    return f"{m}m{s:02d}s" if m else f"{s}s"
+
+
+class ProgressTracker:
+    """Maps per-stage progress onto one overall Gradio progress bar (with ETA) and the console.
+
+    Overall = (job + (generation + stage fraction) / generations) / jobs, where a job is one
+    text file in "separate files" mode, or the whole input otherwise.
+    """
+
+    def __init__(self, progress=None, num_jobs=1):
+        self.progress = progress
+        self.num_jobs = max(1, num_jobs)
+        self.job_index = 0
+        self.job_label = ""
+        self.num_generations = 1
+        self.start_time = time.time()
+        self.overall = 0.0
+
+    def start_job(self, job_index, num_generations, label=""):
+        self.job_index = job_index
+        self.num_generations = max(1, int(num_generations))
+        self.job_label = label
+
+    def update(self, gen_index, stage_start, stage_end, done, total, desc):
+        stage_frac = stage_start + (stage_end - stage_start) * (done / total if total else 1.0)
+        overall = (self.job_index + (gen_index + stage_frac) / self.num_generations) / self.num_jobs
+        self.overall = min(max(overall, 0.0), 1.0)
+        parts = []
+        if self.num_jobs > 1:
+            parts.append(f"File {self.job_index + 1}/{self.num_jobs}" + (f" ({self.job_label})" if self.job_label else ""))
+        if self.num_generations > 1:
+            parts.append(f"Gen {gen_index + 1}/{self.num_generations}")
+        parts.append(desc)
+        self._emit(" · ".join(parts))
+
+    def message(self, desc):
+        """Change the description without moving the bar (e.g. while loading a model)."""
+        self._emit(desc)
+
+    def _emit(self, desc):
+        elapsed = time.time() - self.start_time
+        timing = f"elapsed {_fmt_secs(elapsed)}"
+        if self.overall > 0.02:
+            timing += f", ~{_fmt_secs(elapsed / self.overall - elapsed)} left"
+        if self.progress is not None:
+            self.progress(self.overall, desc=f"{desc} ({timing})")
+        print(f"\033[36m[PROGRESS] {self.overall * 100:5.1f}% {desc} ({timing})\033[0m")
+
+
 def process_one_chunk(
     model, sentence_group, idx, gen_index, this_seed,
     audio_prompt_path_input, exaggeration_input, temperature_input, cfgw_input,
@@ -814,6 +898,8 @@ def process_one_chunk_deterministic(
 
         for cand_idx in range(num_candidates_per_chunk):
             for attempt in range(max_attempts_per_candidate):
+                if _stop_event.is_set():
+                    return (idx, candidates)
                 candidate_seed = derive_seed(this_seed, idx, cand_idx, attempt)
                 print(f"\033[32m[DEBUG] [DET] Generating cand {cand_idx+1} attempt {attempt+1} for chunk {idx} (seed={candidate_seed}).\033[0m")
 
@@ -872,6 +958,9 @@ def process_one_chunk_deterministic(
                     if bypass_whisper_checking:
                         break
 
+                except GenerationInterrupted:
+                    print(f"\033[33m[STOP] Chunk {idx} interrupted mid-generation.\033[0m")
+                    return (idx, candidates)
                 except Exception as e:
                     tb = traceback.format_exc()
                     print(f"[ERROR] Deterministic generation failed for chunk {idx}, cand {cand_idx+1}, attempt {attempt+1}: {e}\n{tb}")
@@ -887,12 +976,26 @@ def process_one_chunk_deterministic(
 
 
 
-def generate_and_preview(*args):
-
-    output_paths = generate_batch_tts(*args)
+def generate_and_preview(*args, progress=None):
+    _stop_event.clear()
+    tracker = ProgressTracker(progress)
+    start = time.time()
+    try:
+        output_paths = generate_batch_tts(*args, tracker=tracker)
+    except Exception as e:
+        traceback.print_exc()
+        gr.Warning(f"Generation failed: {e}")
+        return [], gr.update(choices=[], value=None), None, f"❌ Failed after {_fmt_secs(time.time() - start)}: {e}"
     audio_files = [p for p in output_paths if os.path.splitext(p)[1].lower() in [".wav", ".mp3", ".flac"]]
     dropdown_value = audio_files[0] if audio_files else None
-    return output_paths, gr.update(choices=audio_files, value=dropdown_value), dropdown_value
+    elapsed = _fmt_secs(time.time() - start)
+    if _stop_event.is_set():
+        status = f"⏹ Stopped after {elapsed}. {len(audio_files)} audio file(s) finished before stopping."
+    elif not audio_files:
+        status = f"⚠ Finished in {elapsed}, but no audio was produced. Check the console log."
+    else:
+        status = f"✅ Done in {elapsed}: {len(audio_files)} audio file(s)."
+    return output_paths, gr.update(choices=audio_files, value=dropdown_value), dropdown_value, status
     
 
 def update_audio_preview(selected_path):
@@ -936,12 +1039,34 @@ def generate_batch_tts(
     sound_words_field: str = "",
     use_faster_whisper: bool = False,
     generate_separate_audio_files: bool = False,
+    tracker=None,
 ) -> list[str]:
     print(f"[DEBUG] Received audio_prompt_path_input: {audio_prompt_path_input!r}")
+    tracker = tracker or ProgressTracker()
 
     if not audio_prompt_path_input or (isinstance(audio_prompt_path_input, str) and not os.path.isfile(audio_prompt_path_input)):
         audio_prompt_path_input = None
+    tracker.message("Loading TTS model…")
     model = get_or_load_model()
+
+    # Outputs accumulate here so files finished before a Stop are still returned.
+    collected_outputs = []
+
+    def run_job(job_text, job_basename, job_index=0):
+        tracker.start_job(job_index, num_generations, job_basename.rstrip("_"))
+        process_text_for_tts(
+            job_text, job_basename, audio_prompt_path_input,
+            exaggeration_input, temperature_input, seed_num_input, cfgw_input,
+            use_pyrnnoise,
+            use_auto_editor, ae_threshold, ae_margin, export_formats, enable_batching,
+            to_lowercase, normalize_spacing, fix_dot_letters, remove_reference_numbers, keep_original_wav,
+            smart_batch_short_sentences, disable_watermark, num_generations,
+            normalize_audio, normalize_method, normalize_level, normalize_tp,
+            normalize_lra, num_candidates_per_chunk, max_attempts_per_candidate,
+            bypass_whisper_checking, whisper_model_name, enable_parallel,
+            num_parallel_workers, use_longest_transcript_on_fail, sound_words_field, use_faster_whisper,
+            tracker=tracker, output_paths=collected_outputs,
+        )
 
     # PATCH: Get file basename (to prepend) if a text file was uploaded
     # Support for multiple file uploads
@@ -971,23 +1096,13 @@ def generate_batch_tts(
                 except Exception as e:
                     print(f"[ERROR] Failed to read file: {getattr(fobj, 'name', repr(fobj))} | {e}")
             # Now process each file separately and collect outputs
-            all_outputs = []
-            for job_text, base in all_jobs:
-                output_paths = process_text_for_tts(
-                    job_text, base,
-                    audio_prompt_path_input,
-                    exaggeration_input, temperature_input, seed_num_input, cfgw_input,
-                    use_pyrnnoise,  # <-- add this
-                    use_auto_editor, ae_threshold, ae_margin, export_formats, enable_batching,
-                    to_lowercase, normalize_spacing, fix_dot_letters, remove_reference_numbers, keep_original_wav,
-                    smart_batch_short_sentences, disable_watermark, num_generations,
-                    normalize_audio, normalize_method, normalize_level, normalize_tp,
-                    normalize_lra, num_candidates_per_chunk, max_attempts_per_candidate,
-                    bypass_whisper_checking, whisper_model_name, enable_parallel,
-                    num_parallel_workers, use_longest_transcript_on_fail, sound_words_field, use_faster_whisper
-                )
-                all_outputs.extend(output_paths)
-            return all_outputs  # Return list of output files
+            tracker.num_jobs = max(1, len(all_jobs))
+            try:
+                for job_index, (job_text, base) in enumerate(all_jobs):
+                    run_job(job_text, base, job_index)
+            except GenerationStopped:
+                print("\033[33m[STOP] Generation stopped by user.\033[0m")
+            return collected_outputs  # Return list of output files
 
         # ELSE (default: join all text files as one, as before)
         all_text = []
@@ -1004,34 +1119,15 @@ def generate_batch_tts(
                 print(f"[ERROR] Failed to read file: {getattr(fobj, 'name', repr(fobj))} | {e}")
         text = "\n\n".join(all_text)
         input_basename = "_".join(basenames) + "_"
-
-        return process_text_for_tts(
-            text, input_basename, audio_prompt_path_input,
-            exaggeration_input, temperature_input, seed_num_input, cfgw_input,
-            use_pyrnnoise,
-            use_auto_editor, ae_threshold, ae_margin, export_formats, enable_batching,
-            to_lowercase, normalize_spacing, fix_dot_letters, remove_reference_numbers, keep_original_wav,
-            smart_batch_short_sentences, disable_watermark, num_generations,
-            normalize_audio, normalize_method, normalize_level, normalize_tp,
-            normalize_lra, num_candidates_per_chunk, max_attempts_per_candidate,
-            bypass_whisper_checking, whisper_model_name, enable_parallel,
-            num_parallel_workers, use_longest_transcript_on_fail, sound_words_field, use_faster_whisper
-        )
     else:
         # No text file: just process the Text Input box as one job
         input_basename = "text_input_"
-        return process_text_for_tts(
-            text, input_basename, audio_prompt_path_input,
-            exaggeration_input, temperature_input, seed_num_input, cfgw_input,
-            use_pyrnnoise,
-            use_auto_editor, ae_threshold, ae_margin, export_formats, enable_batching,
-            to_lowercase, normalize_spacing, fix_dot_letters, remove_reference_numbers, keep_original_wav,
-            smart_batch_short_sentences, disable_watermark, num_generations,
-            normalize_audio, normalize_method, normalize_level, normalize_tp,
-            normalize_lra, num_candidates_per_chunk, max_attempts_per_candidate,
-            bypass_whisper_checking, whisper_model_name, enable_parallel,
-            num_parallel_workers, use_longest_transcript_on_fail, sound_words_field, use_faster_whisper
-        )
+
+    try:
+        run_job(text, input_basename)
+    except GenerationStopped:
+        print("\033[33m[STOP] Generation stopped by user.\033[0m")
+    return collected_outputs
 
 def process_text_for_tts(
     text,
@@ -1069,6 +1165,8 @@ def process_text_for_tts(
     use_longest_transcript_on_fail,
     sound_words_field,
     use_faster_whisper=False,
+    tracker=None,
+    output_paths=None,
 ):
 
     
@@ -1137,8 +1235,15 @@ def process_text_for_tts(
     else:
         sentence_groups = sentences
 
-    output_paths = []
+    tracker = tracker or ProgressTracker()
+    # Share of each generation's progress bar spent generating chunks; the rest is
+    # Whisper validation (when enabled) and post-processing.
+    gen_end = 0.9 if bypass_whisper_checking else 0.7
+    validate_end = 0.9
+
+    output_paths = [] if output_paths is None else output_paths
     for gen_index in range(num_generations):
+        check_stop()
         if seed_num_input == 0:
             this_seed = random.randint(1, 2**32 - 1)
         else:
@@ -1154,6 +1259,7 @@ def process_text_for_tts(
         if enable_parallel:
             total_chunks = len(sentence_groups)
             completed = 0
+            tracker.update(gen_index, 0.0, gen_end, 0, total_chunks, f"Generating chunks 0/{total_chunks}")
             with ThreadPoolExecutor(max_workers=num_parallel_workers) as executor:
                 futures = [
                     executor.submit(
@@ -1168,17 +1274,24 @@ def process_text_for_tts(
                     idx, candidates = future.result()
                     chunk_candidate_map[idx] = candidates
                     completed += 1
-                    percent = int(100 * completed / total_chunks)
-                    print(f"\033[36m[PROGRESS] Generated chunk {completed}/{total_chunks} ({percent}%)\033[0m")
+                    if _stop_event.is_set():
+                        for f in futures:
+                            f.cancel()
+                        raise GenerationStopped()
+                    tracker.update(gen_index, 0.0, gen_end, completed, total_chunks, f"Generating chunks {completed}/{total_chunks}")
         else:
             # Sequential mode: Process chunks one by one
+            total_chunks = len(sentence_groups)
             for idx, group in enumerate(sentence_groups):
+                check_stop()
+                tracker.update(gen_index, 0.0, gen_end, idx, total_chunks, f"Generating chunk {idx + 1}/{total_chunks}")
                 idx, candidates = process_one_chunk_deterministic(
                     model, group, idx, gen_index, this_seed,
                     audio_prompt_path_input, exaggeration_input, temperature_input, cfgw_input,
                     disable_watermark, num_candidates_per_chunk, max_attempts_per_candidate, bypass_whisper_checking
                 )
                 chunk_candidate_map[idx] = candidates
+        check_stop()
 
         # -------- WHISPER VALIDATION --------
         if not bypass_whisper_checking:
@@ -1188,6 +1301,7 @@ def process_text_for_tts(
             _free_vram()
 
             model_key = whisper_model_map.get(whisper_model_name, "medium")
+            tracker.message(f"Loading Whisper ({model_key})…")
             whisper_model = load_whisper_backend(model_key, use_faster_whisper, DEVICE)
 
             try:
@@ -1200,7 +1314,10 @@ def process_text_for_tts(
                 chunk_failed_candidates = {chunk_idx: [] for chunk_idx in chunk_candidate_map}
 
                 # Initial sequential Whisper validation
-                for chunk_idx, cand in all_candidates:
+                for cand_num, (chunk_idx, cand) in enumerate(all_candidates):
+                    check_stop()
+                    tracker.update(gen_index, gen_end, validate_end, cand_num, len(all_candidates),
+                                   f"Whisper check {cand_num + 1}/{len(all_candidates)}")
                     candidate_path = cand['path']
                     sentence_group = cand['sentence_group']
                     try:
@@ -1230,7 +1347,10 @@ def process_text_for_tts(
                     if not still_need_retry:
                         break
 
+                    check_stop()
                     print(f"\033[33m[RETRY] Retrying {len(still_need_retry)} chunks, attempt {chunk_attempts[still_need_retry[0]]+1} of {max_attempts_per_candidate}\033[0m")
+                    tracker.message(f"Retry attempt {chunk_attempts[still_need_retry[0]]+1}/{max_attempts_per_candidate}: "
+                                    f"regenerating {len(still_need_retry)} chunk(s) that failed Whisper")
 
                     retry_candidate_map = {}
                     with ThreadPoolExecutor(max_workers=num_parallel_workers) as executor:
@@ -1252,9 +1372,14 @@ def process_text_for_tts(
                         for future in as_completed(futures):
                             idx, candidates = future.result()
                             retry_candidate_map[idx] = candidates
+                            if _stop_event.is_set():
+                                for f in futures:
+                                    f.cancel()
+                                raise GenerationStopped()
 
                     for chunk_idx, candidates in retry_candidate_map.items():
                         for cand in candidates:
+                            check_stop()
                             candidate_path = cand['path']
                             sentence_group = cand['sentence_group']
                             try:
@@ -1339,7 +1464,9 @@ def process_text_for_tts(
         print(f"\33[104m[DEBUG] \33[5mFinal audio concatenated, output file: {wav_output}\033[0m")
 
         # --- DENOISE (optional, before Auto-Editor) ---
+        check_stop()
         if use_pyrnnoise:
+            tracker.update(gen_index, validate_end, 1.0, 0, 4, "Post-processing: denoising")
             if _PYRNNOISE_AVAILABLE:
                 try:
                     if _apply_pyrnnoise_in_place(wav_output):
@@ -1351,7 +1478,9 @@ def process_text_for_tts(
             else:
                 print("[WARNING] pyrnnoise not installed; skipping denoise.")
                 
+        check_stop()
         if use_auto_editor:
+            tracker.update(gen_index, validate_end, 1.0, 1, 4, "Post-processing: auto-editor")
             try:
                 cleaned_output = wav_output.replace(".wav", "_cleaned.wav")
                 stereo_input = wav_output.replace(".wav", "_ae_stereo.wav")
@@ -1397,7 +1526,9 @@ def process_text_for_tts(
                     except Exception:
                         pass
 
+        check_stop()
         if normalize_audio:
+            tracker.update(gen_index, validate_end, 1.0, 2, 4, "Post-processing: normalizing")
             try:
                 norm_temp = wav_output.replace(".wav", "_norm.wav")
                 normalize_with_ffmpeg(
@@ -1416,6 +1547,7 @@ def process_text_for_tts(
             print("\033[33m[WARNING] No export format selected; defaulting to WAV.\033[0m")
             export_formats = ["wav"]
 
+        tracker.update(gen_index, validate_end, 1.0, 3, 4, "Exporting")
         gen_outputs = []
         for export_format in export_formats:
             if export_format.lower() == "wav":
@@ -1492,6 +1624,7 @@ def process_text_for_tts(
         settings_for_json = settings_to_save.copy()
         settings_for_json["output_audio_files"] = gen_outputs
         save_settings_json(settings_for_json, json_path)
+        tracker.update(gen_index, 1.0, 1.0, 1, 1, f"Generation {gen_index + 1} saved")
 
     print(f"\033[1;36m[DEBUG] \33[6;4;3;34;102mALL GENERATIONS COMPLETE. Outputs:\033[0m\n" + "\n".join(output_paths))
     return output_paths
@@ -1645,7 +1778,10 @@ def main(server_name=None, server_port=None, share=False):
                         num_parallel_workers_slider = gr.Slider(1, 8, value=settings["num_parallel_workers_slider"], step=1, label="Parallel Workers - set to 1 for sequential processing")
                         load_settings_file = gr.File(label="Load Settings (.json)", file_types=[".json"])
 
-                        run_button = gr.Button("Generate")
+                        with gr.Row():
+                            run_button = gr.Button("Generate", variant="primary")
+                            stop_button = gr.Button("Stop", variant="stop", interactive=False)
+                        status_box = gr.Textbox(label="Status", value="Idle", interactive=False, lines=1)
                     with gr.Column():
                         exaggeration_slider = gr.Slider(0.0, 2.0, value=settings["exaggeration_slider"], step=0.1, label="Emotion Exaggeration")
                         cfg_weight_slider = gr.Slider(0.1, 1.0, value=settings["cfg_weight_slider"], step=0.01, label="CFG Weight/Pace")
@@ -1789,11 +1925,17 @@ def main(server_name=None, server_port=None, share=False):
              
             
 
-            run_button.click(
-                fn=lambda *args: (
-                    collect_ui_settings(*([args[0]] + list(args[3:]))),  # text_input + rest of option fields (skipping file/audio)
-                    generate_and_preview(*args)
-                )[1],
+            # Gradio injects the progress tracker into the first parameter.
+            def run_generation(progress=gr.Progress(), *args):
+                collect_ui_settings(*([args[0]] + list(args[3:])))  # text_input + rest of option fields (skipping file/audio)
+                return generate_and_preview(*args, progress=progress)
+
+            run_event = run_button.click(
+                fn=lambda: (gr.update(interactive=False), gr.update(interactive=True), "⏳ Starting…"),
+                outputs=[run_button, stop_button, status_box],
+                queue=False,
+            ).then(
+                fn=run_generation,
                 inputs=[
                     text_input,                   # 0
                     text_file_input,              # 1
@@ -1832,8 +1974,15 @@ def main(server_name=None, server_port=None, share=False):
                     use_faster_whisper_checkbox,  #34
                     separate_files_checkbox       #35
                 ],
-                outputs=[output_audio, audio_dropdown, audio_preview],
+                outputs=[output_audio, audio_dropdown, audio_preview, status_box],
             )
+            # .then runs after success or failure, so the buttons always reset.
+            run_event.then(
+                fn=lambda: (gr.update(interactive=True), gr.update(interactive=False)),
+                outputs=[run_button, stop_button],
+                queue=False,
+            )
+            stop_button.click(fn=request_stop, outputs=[status_box], queue=False)
 
 
             # === VC TAB: Voice Conversion Tab ===

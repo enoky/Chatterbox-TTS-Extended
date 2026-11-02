@@ -19,6 +19,15 @@ from .inference.t3_hf_backend import T3HuggingfaceBackend
 logger = logging.getLogger(__name__)
 
 
+class GenerationInterrupted(Exception):
+    """Raised from the sampling loop when `stop_check()` returns True."""
+
+
+# Optional callable polled once per sampled token; the UI sets it so a Stop button
+# can abort a chunk mid-generation instead of waiting for it to finish.
+stop_check = None
+
+
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
         super(AttrDict, self).__init__(*args, **kwargs)
@@ -231,6 +240,8 @@ class T3(nn.Module):
         alive = torch.ones(cond_batch, dtype=torch.bool, device=device)
 
         for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True):
+            if stop_check is not None and stop_check():
+                raise GenerationInterrupted()
             step_logits = output.logits[:, -1, :]  # (2B or B, V)
 
             if cfg_weight > 0.0:
