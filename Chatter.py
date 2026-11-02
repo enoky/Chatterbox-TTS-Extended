@@ -2090,11 +2090,14 @@ def main(server_name=None, server_port=None, share=False):
 
             )
 
-        # Pass through host/port/share from CLI if provided
+        # Pass through host/port/share from CLI if provided.
+        # Allow serving from output/ even when it is a symlink outside the
+        # working directory (e.g. to Google Drive in the Colab notebook).
         demo.launch(
             server_name=server_name,
             server_port=server_port,
             share=share,
+            allowed_paths=[os.path.abspath("output"), os.path.realpath("output")],
         )
 
 if __name__ == "__main__":
