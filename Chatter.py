@@ -1403,8 +1403,12 @@ def process_text_for_tts(
                         print(f"[ERROR] Whisper transcription failed for {candidate_path}: {e}")
                         chunk_failed_candidates[chunk_idx].append((0.0, candidate_path, ""))
 
-                # Retry block for failed chunks
-                retry_queue = [chunk_idx for chunk_idx in sorted(chunk_candidate_map.keys()) if not chunk_validations[chunk_idx]]
+                # Retry block for failed chunks. Empty chunks produce no audio by
+                # design, so there is nothing to retry for them.
+                retry_queue = [
+                    chunk_idx for chunk_idx in sorted(chunk_candidate_map.keys())
+                    if not chunk_validations[chunk_idx] and sentence_groups[chunk_idx].strip()
+                ]
                 chunk_attempts = {chunk_idx: 1 for chunk_idx in retry_queue}
 
                 while retry_queue:
@@ -1421,7 +1425,9 @@ def process_text_for_tts(
                                     f"regenerating {len(still_need_retry)} chunk(s) that failed Whisper")
 
                     retry_candidate_map = {}
-                    with ThreadPoolExecutor(max_workers=num_parallel_workers) as executor:
+                    # Honour the parallel setting: one worker runs retries sequentially.
+                    retry_workers = num_parallel_workers if enable_parallel else 1
+                    with ThreadPoolExecutor(max_workers=retry_workers) as executor:
                         futures = [
                             executor.submit(
                                 process_one_chunk_deterministic,
@@ -1485,7 +1491,7 @@ def process_text_for_tts(
                             print(f"\033[33m[WARNING] No candidate passed for chunk {chunk_idx}. Using failed candidate with highest score: {best_failed[1]} (score={best_failed[0]:.3f})\033[0m")
                         waveform, sr = load_wav(best_failed[1])
                         waveform_list.append(waveform)
-                    else:
+                    elif sentence_groups[chunk_idx].strip():
                         print(f"[ERROR] No candidates were generated for chunk {chunk_idx}.")
             finally:
                 # Clean up Whisper model
@@ -1512,7 +1518,7 @@ def process_text_for_tts(
                     print(f"\033[32m[DEBUG] [Bypass Whisper] Selected {best['path']} (first usable candidate) for chunk {chunk_idx}\033[0m")
                     waveform, sr = load_wav(best['path'])
                     waveform_list.append(waveform)
-                else:
+                elif sentence_groups[chunk_idx].strip():
                     print(f"\033[33m[WARNING] No valid candidates found for chunk {chunk_idx} (all generations failed)\033[0m")
 
 
