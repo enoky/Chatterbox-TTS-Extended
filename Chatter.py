@@ -381,16 +381,29 @@ def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
 
-def derive_seed(base_seed: int, chunk_idx: int, cand_idx: int, attempt_idx: int) -> int:
+# Minimum Whisper fuzzy-match score for a candidate to pass validation. Used by
+# both the first validation pass and the retry rounds.
+WHISPER_PASS_THRESHOLD = 0.85
+
+
+def derive_seed(base_seed: int, chunk_idx: int, cand_idx: int, attempt_idx: int,
+                retry_round: int = 0) -> int:
     """
-    Deterministically derive a 32-bit seed for each (chunk, candidate, attempt)
-    from the user-supplied base seed. This avoids any use of global random().
+    Deterministically derive a 32-bit seed for each (chunk, candidate, attempt,
+    retry round) from the user-supplied base seed. This avoids any use of global
+    random().
+
+    retry_round is 0 for the initial generation pass and 1, 2, ... for each
+    Whisper retry round, so retries sample new audio instead of reproducing a
+    candidate that already failed. Round 0 yields the same seeds as before this
+    parameter existed, so first-pass output for a given seed is unchanged.
     """
     # use 64-bit mixing then clamp to 32-bit
     mix = (np.uint64(base_seed) * np.uint64(1000003)
            + np.uint64(chunk_idx) * np.uint64(10007)
            + np.uint64(cand_idx) * np.uint64(10009)
-           + np.uint64(attempt_idx) * np.uint64(101))
+           + np.uint64(attempt_idx) * np.uint64(101)
+           + np.uint64(retry_round) * np.uint64(7919))
     s = int(mix & np.uint64(0xFFFFFFFF))
     return s if s != 0 else 1
 
@@ -950,7 +963,8 @@ def process_one_chunk_deterministic(
             for attempt in range(max_attempts_per_candidate):
                 if _stop_event.is_set():
                     return (idx, candidates)
-                candidate_seed = derive_seed(this_seed, idx, cand_idx, attempt)
+                candidate_seed = derive_seed(this_seed, idx, cand_idx, attempt,
+                                             retry_round=retry_attempt_number - 1)
                 print(f"\033[32m[DEBUG] [DET] Generating cand {cand_idx+1} attempt {attempt+1} for chunk {idx} (seed={candidate_seed}).\033[0m")
 
                 try:
@@ -1004,9 +1018,13 @@ def process_one_chunk_deterministic(
                         'seed': candidate_seed,
                     })
 
-                    # If bypass is ON we can short-circuit after first successful candidate
-                    if bypass_whisper_checking:
-                        break
+                    # Bypass mode only ever uses one candidate per chunk, so stop
+                    # after the first successful one.
+                    if bypass_whisper_checking and os.path.getsize(candidate_path) > 1024:
+                        return (idx, candidates)
+                    # Attempts only retry generation errors; this candidate
+                    # succeeded, so move on to the next one.
+                    break
 
                 except GenerationInterrupted:
                     print(f"\033[33m[STOP] Chunk {idx} interrupted mid-generation.\033[0m")
@@ -1377,7 +1395,7 @@ def process_text_for_tts(
                             continue
                         path, score, transcribed = whisper_check_mp(candidate_path, sentence_group, whisper_model, use_faster_whisper)
                         print(f"\033[32m[DEBUG] [Chunk {chunk_idx}] {os.path.basename(candidate_path)}: score={score:.3f}, transcript=\033[33m'{transcribed}'\033[0m")
-                        if score >= 0.85:
+                        if score >= WHISPER_PASS_THRESHOLD:
                             chunk_validations[chunk_idx].append((cand['duration'], cand['path']))
                         else:
                             chunk_failed_candidates[chunk_idx].append((score, cand['path'], transcribed))
@@ -1439,7 +1457,7 @@ def process_text_for_tts(
                                     continue
                                 path, score, transcribed = whisper_check_mp(candidate_path, sentence_group, whisper_model, use_faster_whisper)
                                 print(f"\033[32m[DEBUG] [Chunk {chunk_idx}] RETRY {os.path.basename(candidate_path)}: score={score:.3f}, transcript=\033[33m'{transcribed}'\033[0m")
-                                if score >= 0.95:
+                                if score >= WHISPER_PASS_THRESHOLD:
                                     chunk_validations[chunk_idx].append((cand['duration'], cand['path']))
                                 else:
                                     chunk_failed_candidates[chunk_idx].append((score, cand['path'], transcribed))
@@ -1480,7 +1498,8 @@ def process_text_for_tts(
                 except Exception as e:
                     print(f"\033[32m[DEBUG] Could not delete Whisper model: {e}\033[0m")
         else:
-            # Bypass Whisper: pick shortest duration per chunk
+            # Bypass Whisper: use the first usable candidate per chunk (generation
+            # stops after the first successful candidate in bypass mode).
             for chunk_idx in sorted(chunk_candidate_map.keys()):
                 candidates = chunk_candidate_map[chunk_idx]
                 # Only consider candidates whose files exist and are > 1024 bytes
@@ -1489,13 +1508,8 @@ def process_text_for_tts(
                     if os.path.exists(c['path']) and os.path.getsize(c['path']) > 1024
                 ]
                 if valid_candidates:
-                    # Prefer the primary seeded candidate deterministically (cand_idx=0, attempt=0)
-                    if all(('cand_idx' in c and 'attempt' in c) for c in valid_candidates):
-                        best = sorted(valid_candidates, key=lambda c: (c['cand_idx'], c['attempt']))[0]
-                    else:
-                        best = min(valid_candidates, key=lambda c: c['duration'])
-
-                    print(f"\033[32m[DEBUG] [Bypass Whisper] Selected {best['path']} as shortest candidate for chunk {chunk_idx}\033[0m")
+                    best = min(valid_candidates, key=lambda c: (c['cand_idx'], c['attempt']))
+                    print(f"\033[32m[DEBUG] [Bypass Whisper] Selected {best['path']} (first usable candidate) for chunk {chunk_idx}\033[0m")
                     waveform, sr = load_wav(best['path'])
                     waveform_list.append(waveform)
                 else:
@@ -1808,8 +1822,8 @@ def main(server_name=None, server_port=None, share=False):
                         disable_watermark_checkbox = gr.Checkbox(label="Disable Perth Watermark", value=settings["disable_watermark_checkbox"], visible=False)
                         num_generations_input = gr.Number(value=settings["num_generations_input"], precision=0, label="Number of Generations")
                         num_candidates_slider = gr.Slider(1, 10, value=settings["num_candidates_slider"], step=1, label="Number of Candidates Per Chunk (after batching) - [reduces the chance of artifacts and hallucinations]")
-                        max_attempts_slider = gr.Slider(1, 10, value=settings["max_attempts_slider"], step=1, label="Max Attempts Per Candidate (Whisper check retries)")
-                        bypass_whisper_checkbox = gr.Checkbox(label="Bypass Whisper Checking (pick shortest candidate regardless of transcription)", value=settings["bypass_whisper_checkbox"])
+                        max_attempts_slider = gr.Slider(1, 10, value=settings["max_attempts_slider"], step=1, label="Max Attempts Per Chunk (1 = no Whisper retries; also retries generation errors)")
+                        bypass_whisper_checkbox = gr.Checkbox(label="Bypass Whisper Checking (use the first generated candidate; skips transcription checks and extra candidates)", value=settings["bypass_whisper_checkbox"])
                         whisper_model_dropdown = gr.Dropdown(
                             choices=whisper_model_choices,
                             value=settings["whisper_model_dropdown"],
@@ -2257,9 +2271,10 @@ def main(server_name=None, server_port=None, share=False):
             ### **How Candidate Selection Works**
             - For each chunk, the model creates the specified number of candidate audio variations.
             - If Whisper checking is enabled:  
-              - Each candidate is transcribed, and the one with the closest match to the input text is chosen.
+              - Each candidate is transcribed; candidates that match the input text closely enough pass, and the shortest passing candidate is chosen.
+              - Chunks with no passing candidate are regenerated with fresh seeds, up to *Max Attempts* rounds in total.
             - If Whisper is bypassed:  
-              - The shortest-duration candidate is chosen (assumed best).
+              - Generation stops at the first successful candidate for each chunk, and that candidate is used.
             - If all candidates fail validation after retries:  
               - The candidate with the highest Whisper score is used, or the one with the most text characters, depending on user settings.
 

@@ -144,8 +144,8 @@ Chatterbox-TTS-Extended is a *power-user TTS pipeline* for advanced single and b
 
 - **Number of generations:** Produce multiple different outputs at once (“takes”).  
 - **Candidates per chunk:** For each chunk, generate multiple variants.  
-- **Max attempts per candidate:** If validation fails, retry up to N times.  
-- **Deterministic seeding:** A per-chunk/per-candidate/per-attempt seed is derived from the base seed for reproducibility.  
+- **Max attempts:** If no candidate for a chunk passes Whisper validation, regenerate that chunk with fresh seeds, up to N rounds in total (1 = no retries). Also retries a candidate whose generation errors out.  
+- **Deterministic seeding:** A per-chunk/per-candidate/per-attempt/per-retry-round seed is derived from the base seed for reproducibility.  
 - **Fallback strategies:** If all candidates fail validation, use the longest transcript or highest similarity score.
 
 ---
